@@ -2,34 +2,40 @@
 import os
 import glob
 import json
-import hashlib
 import numpy as np
 import requests
 import streamlit as st
 import faiss
 import fitz  # PyMuPDF
+from io import BytesIO
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 # -----------------------
-# Load env (for OpenRouter + prompt config)
+# Env / secrets
 # -----------------------
 load_dotenv()
+
+def get_secret(name: str, default: str | None = None):
+    """Prefer Streamlit Cloud secrets; fallback to env vars."""
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
 # -----------------------
 # Config
 # -----------------------
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"   # fast & free
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 OPENROUTER_MODEL = "mistralai/mistral-7b-instruct"
-DOCS_DIR = "docs"               # put PDFs here
-INDEX_DIR = "vector_store"      # FAISS + metadata stored here
+DOCS_DIR = "docs"          # used only when not in ephemeral mode
+INDEX_DIR = "vector_store" # used only when not in ephemeral mode
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 TOP_K_DEFAULT = 5
 
-# -----------------------
-# System prompt (backend-only)
-# -----------------------
 DEFAULT_SYSTEM_PROMPT = (
     "You are a focused, concise RAG assistant.\n"
     "- Answer ONLY using the provided context.\n"
@@ -39,13 +45,8 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 def get_system_prompt() -> str:
-    """
-    Resolve system prompt in this priority:
-    1) SYSTEM_PROMPT_PATH file (e.g., system_prompt.txt)
-    2) SYSTEM_PROMPT env var
-    3) DEFAULT_SYSTEM_PROMPT
-    """
-    path = os.getenv("SYSTEM_PROMPT_PATH")
+    """Resolve system prompt from file path or env/secret."""
+    path = get_secret("SYSTEM_PROMPT_PATH")
     if path and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -54,11 +55,11 @@ def get_system_prompt() -> str:
                     return txt
         except Exception:
             pass
-    env_val = os.getenv("SYSTEM_PROMPT")
+    env_val = get_secret("SYSTEM_PROMPT")
     return (env_val.strip() if env_val else DEFAULT_SYSTEM_PROMPT)
 
 # -----------------------
-# Utilities
+# Utils
 # -----------------------
 def ensure_dir(p: str):
     if not os.path.exists(p):
@@ -66,9 +67,7 @@ def ensure_dir(p: str):
 
 def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     text = " ".join(text.split())
-    chunks = []
-    start = 0
-    n = len(text)
+    chunks, start, n = [], 0, len(text)
     while start < n:
         end = min(start + chunk_size, n)
         piece = text[start:end].strip()
@@ -81,6 +80,13 @@ def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
 def load_pdf_text(path: str) -> str:
     doc = fitz.open(path)
+    parts = []
+    for page in doc:
+        parts.append(page.get_text("text", sort=True))
+    return "\n".join(parts)
+
+def load_pdf_text_from_bytes(b: bytes) -> str:
+    doc = fitz.open(stream=b, filetype="pdf")
     parts = []
     for page in doc:
         parts.append(page.get_text("text", sort=True))
@@ -99,31 +105,31 @@ def load_jsonl(path):
     return out
 
 # -----------------------
-# Vector Store
+# Vector store
 # -----------------------
 class VectorStore:
-    def __init__(self, index_path: str, meta_path: str, model_name=EMBED_MODEL_NAME):
+    def __init__(self, index_path: str | None, meta_path: str | None, model_name=EMBED_MODEL_NAME):
         self.index_path = index_path
         self.meta_path = meta_path
         self.model = SentenceTransformer(model_name)
         self.index = None
         self.meta = None
 
+    # ---------- Persistent (disk) ----------
     def load(self) -> bool:
+        if not self.index_path or not self.meta_path:
+            return False
         if os.path.exists(self.index_path) and os.path.exists(self.meta_path):
             self.index = faiss.read_index(self.index_path)
             self.meta = load_jsonl(self.meta_path)
             return True
         return False
 
-    def build(self, docs_dir=DOCS_DIR):
-        # Gather PDFs
+    def build_from_docs_dir(self, docs_dir=DOCS_DIR):
         pdfs = sorted(glob.glob(os.path.join(docs_dir, "*.pdf")))
         if not pdfs:
             raise RuntimeError("No PDFs found in ./docs")
-
-        corpus = []
-        meta = []
+        corpus, meta = [], []
         for p in pdfs:
             try:
                 text = load_pdf_text(p)
@@ -135,26 +141,44 @@ class VectorStore:
             for i, ch in enumerate(chunks):
                 corpus.append(ch)
                 meta.append({"source": base, "chunk_id": i})
+        self._fit_and_optionally_persist(corpus, meta)
 
+    # ---------- Ephemeral (in-memory) ----------
+    def build_from_inmemory_files(self, files: list[tuple[str, bytes]]):
+        """
+        files: list of (filename, bytes)
+        """
+        corpus, meta = [], []
+        for fname, data in files:
+            try:
+                text = load_pdf_text_from_bytes(data)
+            except Exception as e:
+                print(f"Failed to read {fname}: {e}")
+                continue
+            chunks = chunk_text(text)
+            for i, ch in enumerate(chunks):
+                corpus.append(ch)
+                meta.append({"source": fname, "chunk_id": i})
         if not corpus:
-            raise RuntimeError("No text extracted from PDFs.")
+            raise RuntimeError("No text extracted from uploaded PDFs.")
+        # Do NOT persist in ephemeral mode
+        self._fit_and_optionally_persist(corpus, meta, persist=False)
 
-        # Embed
+    # ---------- Common fit ----------
+    def _fit_and_optionally_persist(self, corpus, meta, persist=True):
         embs = self.model.encode(
             corpus, batch_size=64, normalize_embeddings=True, show_progress_bar=True
         )
         embs = np.array(embs, dtype="float32")
         d = embs.shape[1]
-
-        # Cosine similarity via inner product on normalized vectors
-        index = faiss.IndexFlatIP(d)
+        index = faiss.IndexFlatIP(d)  # cosine via normalized
         index.add(embs)
         self.index = index
         self.meta = [{"text": t, **m} for t, m in zip(corpus, meta)]
-
-        # Persist
-        faiss.write_index(self.index, self.index_path)
-        save_jsonl(self.meta_path, self.meta)
+        if persist and self.index_path and self.meta_path:
+            ensure_dir(os.path.dirname(self.index_path))
+            faiss.write_index(self.index, self.index_path)
+            save_jsonl(self.meta_path, self.meta)
 
     def search(self, query: str, top_k: int):
         if self.index is None:
@@ -173,25 +197,22 @@ class VectorStore:
         return hits
 
 # -----------------------
-# OpenRouter (chat completions)
+# OpenRouter
 # -----------------------
 def call_openrouter(messages, model=OPENROUTER_MODEL, temperature=0.1, max_tokens=700) -> str:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = get_secret("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    # Optional attribution (helps OpenRouter)
-    ref = os.getenv("HTTP_REFERER")
-    ttl = os.getenv("X_TITLE")
+    ref = get_secret("HTTP_REFERER")
+    ttl = get_secret("X_TITLE")
     if ref:
         headers["HTTP-Referer"] = ref
     if ttl:
         headers["X-Title"] = ttl
-
     payload = {
         "model": model,
         "messages": messages,
@@ -205,7 +226,7 @@ def call_openrouter(messages, model=OPENROUTER_MODEL, temperature=0.1, max_token
     return data["choices"][0]["message"]["content"]
 
 # -----------------------
-# Prompt builder
+# Prompt
 # -----------------------
 def build_prompt(context_chunks, user_query: str):
     context_blob = "\n\n".join(
@@ -229,7 +250,7 @@ def build_prompt(context_chunks, user_query: str):
 def main():
     st.set_page_config(page_title="Simple RAG Chat", page_icon="🧠", layout="wide")
     st.title("🧠 Simple RAG Chat (FAISS + OpenRouter Mistral)")
-    st.caption("Put PDFs in the `docs/` folder. Index builds automatically. System prompt is loaded from backend.")
+    st.caption("Upload PDFs ephemerally or index files from ./docs. System prompt is backend-controlled.")
 
     ensure_dir(DOCS_DIR)
     ensure_dir(INDEX_DIR)
@@ -243,39 +264,81 @@ def main():
         top_k = st.slider("Top-K context chunks", 2, 12, TOP_K_DEFAULT, 1)
         temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.1)
         model = st.text_input("OpenRouter Model", OPENROUTER_MODEL)
-        reindex = st.button("Rebuild Index")
 
         st.markdown("---")
-        st.write("📄 PDFs found:")
-        for p in sorted(glob.glob(os.path.join(DOCS_DIR, "*.pdf"))):
-            st.write("•", os.path.basename(p))
+        ephemeral = st.toggle("Ephemeral uploads (do NOT save files)", value=True,
+                              help="If enabled, uploaded PDFs are processed in-memory and never written to disk.")
+        uploads = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+
+        reindex = st.button("Build / Rebuild Index")
 
         st.markdown("---")
+        if not ephemeral:
+            st.write("📄 PDFs in ./docs:")
+            for p in sorted(glob.glob(os.path.join(DOCS_DIR, "*.pdf"))):
+                st.write("•", os.path.basename(p))
         with st.expander("ℹ️ Active System Prompt (read-only)"):
             st.code(get_system_prompt())
 
-    # Init / Load store (cache model in session)
+    # Init / Load store
     if "store" not in st.session_state:
         st.session_state.store = VectorStore(index_path=index_path, meta_path=meta_path)
-
     store: VectorStore = st.session_state.store
-    need_build = reindex or (not store.load())
-    if need_build:
+
+    # Build / Rebuild logic
+    def build_index():
+        if uploads and ephemeral:
+            files = [(u.name, u.getvalue()) for u in uploads]
+            store.build_from_inmemory_files(files)
+            st.success(f"Indexed {len(store.meta)} chunks from {len(files)} uploaded file(s). (Ephemeral)")
+        elif uploads and not ephemeral:
+            # Persist files then build from docs dir
+            for u in uploads:
+                with open(os.path.join(DOCS_DIR, u.name), "wb") as f:
+                    f.write(u.getbuffer())
+            store.build_from_docs_dir(DOCS_DIR)
+            st.success(f"Saved uploads and indexed {len(store.meta)} chunks from ./docs.")
+        else:
+            # No uploads: use existing persistent docs
+            store.build_from_docs_dir(DOCS_DIR)
+            st.success(f"Indexed {len(store.meta)} chunks from ./docs.")
+
+    # Load existing persistent index if available and not ephemeral/no uploads
+    loaded = False
+    if not ephemeral and not uploads:
+        loaded = store.load()
+        if loaded:
+            st.info("Loaded existing index from disk.")
+
+    if reindex or (not loaded and not uploads and not ephemeral and not store.load()):
         with st.spinner("Building/Updating index…"):
             try:
-                store.build(DOCS_DIR)
-                st.success(f"Indexed {len(store.meta)} chunks.")
+                build_index()
             except Exception as e:
                 st.error(str(e))
                 return
-
-    # Chat input
+    elif uploads and ephemeral and store.index is None:
+        # If user uploaded files in ephemeral mode, build immediately for first run
+        with st.spinner("Indexing uploaded files (ephemeral)…"):
+            try:
+                build_index()
+            except Exception as e:
+                st.error(str(e))
+                return
+    elif store.index is None:
+        # As a last resort (fresh app, no uploads, ephemeral ON): warn user
+        st.warning("No index loaded. Upload PDFs (ephemeral) and/or turn OFF 'Ephemeral uploads' to use ./docs, then click 'Build / Rebuild Index'.")
+    
+    # Chat
     st.markdown("## Ask a question")
     query = st.text_input("Your question", placeholder="e.g., What is Dosha?")
     ask = st.button("Ask")
 
     if ask and query.strip():
-        # Retrieve
+        if store.index is None:
+            st.error("No index is available. Please build the index first.")
+            return
+
         with st.spinner("Retrieving context…"):
             hits = store.search(query, top_k=top_k)
 
@@ -284,7 +347,6 @@ def main():
                 st.markdown(f"- **{h['source']}** (chunk {h['chunk_id']}), score={h['score']:.3f}")
             st.code("\n\n".join(h["text"] for h in hits[:3]))
 
-        # Generate
         messages = build_prompt(hits, query)
         try:
             with st.spinner("Calling OpenRouter…"):
@@ -296,7 +358,6 @@ def main():
         st.markdown("## Answer")
         st.write(answer)
 
-        # Sources list
         st.markdown("#### Sources")
         by_src = {}
         for h in hits:
